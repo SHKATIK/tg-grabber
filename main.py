@@ -1,383 +1,343 @@
 import asyncio
 import logging
-import os
 import re
-import sqlite3
-from datetime import datetime, timedelta
-from typing import Optional
-
-import aiohttp
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandObject, CommandStart
+import aiosqlite
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
-# =======================================================
-# 1. ЗАГРУЗКА ТОКЕНА И НАСТРОЕК
-# =======================================================
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8868698546:AAHUgnSwYlmgGlNvDg2l5_HzD0PDXBfPTXc")
-BOT_USERNAME = "tg_grabber_robot"
-
-REF_REWARD_DAYS = 7   # Сколько дней давать за приглашенного друга
-SUB_PRICE_RUB = 299   # Стоимость подписки за месяц
+# --- КОНФИГУРАЦИЯ ---
+API_ID = 26695279
+API_HASH = "13ad7ad5407f42fa50bcce8012d59065"
+SESSION_STRING = "1ApWapzMBu66oSs3Y6tA4IZDdXfS2kLUQrjwd1rFa0r0KWwM2_rS-p0d6Ax8Ap4yMYNN2lYG74EGMGo4FQc3uhxBRQeB6wyfd4jqNcwBsbzh4uisdVs-ALrpxYF60OTZvzh1JVJaLrBlXAykX8jGoVQctfYB7g5GsNJ-Mc4Icuarzl7jnyleqMxxNgMycjxOX3FmnfIQ_tlYfDV1jlLemfv725Eu7fZBGGXbh-5o-EOmH7t3WvmjCNUXMI_SkgCBtEHTUEh-yUlI6f8TKxwmwGi-AyEYGK3YOQmb76ud3_BbKBS6Z93iR6ZiwmbgBnuaAHS-2fbO3d2TVbdNTYo3yQpvjZNdRr04="
+BOT_TOKEN = "8868698546:AAHUgnSwYlmgGlNvDg2l5_HzD0PDXBfPTXc"
+DB_NAME = "grabber.db"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# Инициализация клиентов
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# =======================================================
-# 2. БАЗА ДАННЫХ (SQLite)
-# =======================================================
-def db_init():
-    with sqlite3.connect("grabber_saas.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                referrer_id INTEGER,
-                sub_until TEXT,
-                donor_channel TEXT,
-                target_channel TEXT,
-                signature TEXT,
-                filter_ads INTEGER DEFAULT 1,
-                balance REAL DEFAULT 0.0
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS posted_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                post_id TEXT,
-                posted_at TEXT
-            )
-        """)
-        conn.commit()
-
-def db_get_user(user_id: int):
-    with sqlite3.connect("grabber_saas.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        return cursor.fetchone()
-
-def db_register_user(user_id: int, referrer_id: Optional[int] = None):
-    with sqlite3.connect("grabber_saas.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-        if not cursor.fetchone():
-            # 24 часа бесплатного тест-драйва для новых пользователей
-            trial_sub = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
-            if referrer_id == user_id:
-                referrer_id = None
-            cursor.execute(
-                "INSERT INTO users (user_id, referrer_id, sub_until) VALUES (?, ?, ?)",
-                (user_id, referrer_id, trial_sub)
-            )
-            conn.commit()
-
-            if referrer_id:
-                db_add_sub_days(referrer_id, REF_REWARD_DAYS)
-
-def db_add_sub_days(user_id: int, days: int):
-    with sqlite3.connect("grabber_saas.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT sub_until FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        if row and row[0]:
-            current_date = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-            start_date = max(current_date, datetime.now())
-        else:
-            start_date = datetime.now()
-        new_date = (start_date + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-        cursor.execute("UPDATE users SET sub_until = ? WHERE user_id = ?", (new_date, user_id))
-        conn.commit()
-
-def db_update_field(user_id: int, field: str, value):
-    with sqlite3.connect("grabber_saas.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
-        conn.commit()
-
-def db_is_post_sent(user_id: int, post_id: str) -> bool:
-    with sqlite3.connect("grabber_saas.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM posted_history WHERE user_id = ? AND post_id = ?", (user_id, post_id))
-        return cursor.fetchone() is not None
-
-def db_mark_post_sent(user_id: int, post_id: str):
-    with sqlite3.connect("grabber_saas.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO posted_history (user_id, post_id, posted_at) VALUES (?, ?, ?)",
-            (user_id, post_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        )
-        conn.commit()
-
-# =======================================================
-# 3. FSM СОСТОЯНИЯ
-# =======================================================
 class SetupState(StatesGroup):
     waiting_for_donor = State()
     waiting_for_target = State()
-    waiting_for_signature = State()
 
-# =======================================================
-# 4. МЕНЮ И КНОПКИ
-# =======================================================
-def get_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    user = db_get_user(user_id)
-    donor = f"@{user[3]}" if user and user[3] else "❌ Не задан"
-    target = user[4] if user and user[4] else "❌ Не привязан"
+# --- РАБОТА С БАЗОЙ ДАННЫХ ---
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY,
+                target_chat TEXT,
+                is_active INTEGER DEFAULT 1,
+                clean_links INTEGER DEFAULT 1,
+                clean_tags INTEGER DEFAULT 1
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS donors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id INTEGER UNIQUE,
+                title TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                donor_id INTEGER,
+                post_id INTEGER,
+                PRIMARY KEY (donor_id, post_id)
+            )
+        """)
+        await db.execute("""
+            INSERT OR IGNORE INTO settings (id, target_chat, is_active, clean_links, clean_tags)
+            VALUES (1, '', 1, 1, 1)
+        """)
+        await db.commit()
 
+async def get_settings():
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM settings WHERE id = 1") as cursor:
+            return await cursor.fetchone()
+
+async def update_setting(column: str, value):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(f"UPDATE settings SET {column} = ? WHERE id = 1", (value,))
+        await db.commit()
+
+async def get_donors():
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM donors") as cursor:
+            return await cursor.fetchall()
+
+# --- КЛАВИАТУРЫ ---
+def kb_main_menu(is_active: bool):
+    status_emoji = "🟢 РАБОТАЕТ" if is_active else "🔴 НА ПАУЗЕ"
+    toggle_text = "⏸ Поставить на паузу" if is_active else "▶️ Запустить пересылку"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📥 Донор: {donor}", callback_data="set_donor")],
-        [InlineKeyboardButton(text=f"📤 Канал: {target}", callback_data="set_target")],
-        [InlineKeyboardButton(text="✍️ Моя подпись под постами", callback_data="set_sig")],
-        [InlineKeyboardButton(text="💳 Продлить подписку (299₽)", callback_data="buy_sub")],
-        [InlineKeyboardButton(text="🔗 Партнерская программа", callback_data="ref_system")]
+        [InlineKeyboardButton(text=f"Статус: {status_emoji}", callback_data="none")],
+        [InlineKeyboardButton(text=toggle_text, callback_data="toggle_status")],
+        [
+            InlineKeyboardButton(text="📥 Доноры", callback_data="menu_donors"),
+            InlineKeyboardButton(text="📤 Канал публикации", callback_data="menu_target")
+        ],
+        [InlineKeyboardButton(text="⚙️ Фильтры и очистка", callback_data="menu_filters")]
     ])
 
-# =======================================================
-# 5. ХЕНДЛЕРЫ БОТА
-# =======================================================
+def kb_donors_menu(donors_list):
+    buttons = []
+    for d in donors_list:
+        buttons.append([
+            InlineKeyboardButton(text=f"🗑 {d['title']}", callback_data=f"del_donor_{d['channel_id']}")
+        ])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить донора", callback_data="add_donor")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад в меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def kb_filters_menu(clean_links: bool, clean_tags: bool):
+    links_text = "✅ Удалять ссылки (http, t.me)" if clean_links else "❌ Удалять ссылки (выкл)"
+    tags_text = "✅ Удалять теги (@username)" if clean_tags else "❌ Удалять теги (выкл)"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=links_text, callback_data="toggle_clean_links")],
+        [InlineKeyboardButton(text=tags_text, callback_data="toggle_clean_tags")],
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="main_menu")]
+    ])
+
+def kb_back_to_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="main_menu")]
+    ])
+
+# --- ОЧИСТКА ТЕКСТА ---
+def clean_post_text(text: str, clean_links: bool, clean_tags: bool) -> str:
+    if not text:
+        return ""
+    if clean_links:
+        text = re.sub(r'https?://\S+|t\.me/\S+', '', text)
+    if clean_tags:
+        text = re.sub(r'@[a-zA-Z0-9_]+', '', text)
+    return text.strip()
+
+# --- ОБРАБОТЧИКИ AIOGRAM ---
 @dp.message(CommandStart())
-async def start_cmd(message: types.Message, command: CommandObject):
-    ref_id = None
-    if command.args and command.args.startswith("ref_"):
-        try:
-            ref_id = int(command.args.replace("ref_", ""))
-        except ValueError:
-            pass
-
-    db_register_user(message.from_user.id, ref_id)
-    user = db_get_user(message.from_user.id)
-    sub_until = user[2] if user else "1 день"
-
-    text = (
-        f"🤖 <b>Добро пожаловать в TG-GRABBER SaaS!</b>\n\n"
-        f"Автоматический перенос постов из любых открытых каналов в твой канал с зачисткой чужих ссылок и рекламы.\n\n"
-        f"⏳ <b>Подписка активна до:</b> <code>{sub_until}</code>\n"
-        f"💡 <i>Вам выдан бесплатный пробный период на 24 часа.</i>"
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    settings = await get_settings()
+    await message.answer(
+        "👋 **Панель управления автограббером**\n\n"
+        "Бот перехватывает новые посты из каналов-доноров и автоматически публикует в твою целевую группу.",
+        reply_markup=kb_main_menu(bool(settings["is_active"])),
+        parse_mode=ParseMode.MARKDOWN
     )
-    await message.answer(text, reply_markup=get_main_keyboard(message.from_user.id), parse_mode="HTML")
 
-@dp.callback_query(F.data == "set_donor")
-async def step_donor(cb: types.CallbackQuery, state: FSMContext):
-    await cb.message.answer(
-        "📥 <b>Отправь юзернейм или ссылку на открытый канал-донор.</b>\n\n"
-        "<i>Пример: @durov или https://t.me/tginfo</i>",
-        parse_mode="HTML"
+@dp.callback_query(F.data == "main_menu")
+async def cb_main_menu(query: CallbackQuery, state: FSMContext):
+    await state.clear()
+    settings = await get_settings()
+    await query.message.edit_text(
+        "👋 **Панель управления автограббером**\n\n"
+        "Выбери нужный раздел настроек ниже:",
+        reply_markup=kb_main_menu(bool(settings["is_active"])),
+        parse_mode=ParseMode.MARKDOWN
     )
+    await query.answer()
+
+@dp.callback_query(F.data == "toggle_status")
+async def cb_toggle_status(query: CallbackQuery):
+    settings = await get_settings()
+    new_status = 0 if settings["is_active"] else 1
+    await update_setting("is_active", new_status)
+    await query.message.edit_reply_markup(reply_markup=kb_main_menu(bool(new_status)))
+    await query.answer()
+
+@dp.callback_query(F.data == "menu_donors")
+async def cb_menu_donors(query: CallbackQuery):
+    donors = await get_donors()
+    text = "📥 **Список каналов-доноров:**\n\n"
+    if not donors:
+        text += "Каналы ещё не добавлены. Нажми «➕ Добавить донора»."
+    else:
+        text += "Нажми на канал, чтобы удалить его из списка отслеживания:"
+    await query.message.edit_text(text, reply_markup=kb_donors_menu(donors), parse_mode=ParseMode.MARKDOWN)
+    await query.answer()
+
+@dp.callback_query(F.data == "add_donor")
+async def cb_add_donor(query: CallbackQuery, state: FSMContext):
     await state.set_state(SetupState.waiting_for_donor)
-    await cb.answer()
+    await query.message.edit_text(
+        "📥 **Отправь юзернейм или ссылку на канал-донор**\n\n"
+        "Примеры:\n"
+        "• `@channel_name`\n"
+        "• `https://t.me/joinchat/...` (для приватных каналов)\n"
+        "• Перешли любое сообщение из этого канала сюда.",
+        reply_markup=kb_back_to_menu(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await query.answer()
 
 @dp.message(SetupState.waiting_for_donor)
-async def save_donor(message: types.Message, state: FSMContext):
-    raw = message.text.strip().replace("https://t.me/", "").replace("@", "").replace("/", "")
-    db_update_field(message.from_user.id, "donor_channel", raw)
-    await state.clear()
-    await message.answer(f"✅ Канал-донор <b>@{raw}</b> успешно сохранен!", reply_markup=get_main_keyboard(message.from_user.id), parse_mode="HTML")
+async def process_donor_input(message: Message, state: FSMContext):
+    input_data = message.forward_from_chat.id if message.forward_from_chat else message.text.strip()
+    try:
+        entity = await client.get_entity(input_data)
+        title = getattr(entity, 'title', str(input_data))
+        channel_id = entity.id
 
-@dp.callback_query(F.data == "set_target")
-async def step_target(cb: types.CallbackQuery, state: FSMContext):
-    await cb.message.answer(
-        "📤 <b>Привязка твоего целевого канала:</b>\n\n"
-        "1. Добавь этого бота (<code>@tg_grabber_robot</code>) в свой канал в роли <b>Администратора</b> (с правом публикации сообщений).\n"
-        "2. Отправь мне <b>@username</b> твоего канала или перешли сюда любой пост из него.",
-        parse_mode="HTML"
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO donors (channel_id, title) VALUES (?, ?)",
+                (channel_id, title)
+            )
+            await db.commit()
+
+        await state.clear()
+        donors = await get_donors()
+        await message.answer(
+            f"✅ Канал **{title}** успешно добавлен в доноры!",
+            reply_markup=kb_donors_menu(donors),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        await message.answer(
+            f"❌ Не удалось найти канал: `{e}`\n"
+            "Убедись, что твой Telegram-аккаунт подписан на этот канал.",
+            reply_markup=kb_back_to_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+@dp.callback_query(F.data.startswith("del_donor_"))
+async def cb_del_donor(query: CallbackQuery):
+    channel_id = int(query.data.replace("del_donor_", ""))
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM donors WHERE channel_id = ?", (channel_id,))
+        await db.commit()
+    donors = await get_donors()
+    await query.message.edit_text(
+        "🗑 Донор успешно удален.",
+        reply_markup=kb_donors_menu(donors)
     )
+    await query.answer()
+
+@dp.callback_query(F.data == "menu_target")
+async def cb_menu_target(query: CallbackQuery, state: FSMContext):
+    settings = await get_settings()
+    current = settings["target_chat"] if settings["target_chat"] else "Не установлен"
     await state.set_state(SetupState.waiting_for_target)
-    await cb.answer()
+    await query.message.edit_text(
+        f"📤 **Канал для публикации постов**\n\n"
+        f"Текущий получатель: `{current}`\n\n"
+        "Отправь сюда **@username** или **ID** (например `-1001234567890`) твоего канала/группы.\n"
+        "*(Убедись, что твой аккаунт или бот состоит в этом канале с правами публикации)*",
+        reply_markup=kb_back_to_menu(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await query.answer()
 
 @dp.message(SetupState.waiting_for_target)
-async def save_target(message: types.Message, state: FSMContext):
-    target = None
-    if message.forward_from_chat and message.forward_from_chat.type == "channel":
-        target = str(message.forward_from_chat.id)
-    elif message.text:
-        target = message.text.strip()
-        if not target.startswith("@") and not target.startswith("-100"):
-            target = f"@{target}"
-
-    if target:
-        db_update_field(message.from_user.id, "target_channel", target)
-        await state.clear()
-        await message.answer(f"✅ Целевой канал <b>{target}</b> привязан!", reply_markup=get_main_keyboard(message.from_user.id), parse_mode="HTML")
-    else:
-        await message.answer("❌ Не удалось распознать канал. Отправь юзернейм (например @my_channel).")
-
-@dp.callback_query(F.data == "set_sig")
-async def step_sig(cb: types.CallbackQuery, state: FSMContext):
-    await cb.message.answer(
-        "✍️ <b>Введи подпись, которая будет добавляться под каждым постом.</b>\n\n"
-        "<i>Пример: 👉 Подпишись: @my_channel\nОтправь цифру 0, чтобы отключить подпись.</i>",
-        parse_mode="HTML"
-    )
-    await state.set_state(SetupState.waiting_for_signature)
-    await cb.answer()
-
-@dp.message(SetupState.waiting_for_signature)
-async def save_sig(message: types.Message, state: FSMContext):
-    sig = "" if message.text.strip() == "0" else message.text.strip()
-    db_update_field(message.from_user.id, "signature", sig)
+async def process_target_input(message: Message, state: FSMContext):
+    target = message.text.strip()
+    await update_setting("target_chat", target)
     await state.clear()
-    await message.answer("✅ Подпись успешно обновлена!", reply_markup=get_main_keyboard(message.from_user.id))
-
-@dp.callback_query(F.data == "ref_system")
-async def ref_handler(cb: types.CallbackQuery):
-    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{cb.from_user.id}"
-    with sqlite3.connect("grabber_saas.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (cb.from_user.id,))
-        count = cursor.fetchone()[0]
-
-    text = (
-        "💼 <b>Партнерская реферальная система</b>\n\n"
-        f"🔗 <b>Твоя ссылка для приглашений:</b>\n<code>{ref_link}</code>\n\n"
-        f"👥 Приглашено друзей: <b>{count}</b>\n"
-        f"🎁 <b>Бонус:</b> +{REF_REWARD_DAYS} дней работы граббера за каждого активного реферала!"
+    settings = await get_settings()
+    await message.answer(
+        f"✅ Канал публикации успешно обновлен на `{target}`!",
+        reply_markup=kb_main_menu(bool(settings["is_active"])),
+        parse_mode=ParseMode.MARKDOWN
     )
-    await cb.message.answer(text, parse_mode="HTML")
-    await cb.answer()
 
-@dp.callback_query(F.data == "buy_sub")
-async def buy_handler(cb: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить 299 ₽ (1 месяц)", callback_data="pay_month")],
-        [InlineKeyboardButton(text="⭐️ Оплатить 150 Stars", callback_data="pay_month")]
-    ])
-    await cb.message.answer(
-        "💎 <b>Оформление подписки на TG-GRABBER:</b>\n\n"
-        "• Работа 24/7 без ограничений\n"
-        "• Мгновенный перенос контента\n"
-        "• Полная зачистка чужих ссылок и рекламы\n\n"
-        "Выбери вариант оплаты:",
-        reply_markup=kb,
-        parse_mode="HTML"
+@dp.callback_query(F.data == "menu_filters")
+async def cb_menu_filters(query: CallbackQuery):
+    settings = await get_settings()
+    await query.message.edit_text(
+        "⚙️ **Настройки очистки рекламы и ссылок:**",
+        reply_markup=kb_filters_menu(bool(settings["clean_links"]), bool(settings["clean_tags"]))
     )
-    await cb.answer()
+    await query.answer()
 
-@dp.callback_query(F.data == "pay_month")
-async def process_pay(cb: types.CallbackQuery):
-    db_add_sub_days(cb.from_user.id, 30)
-    await cb.message.answer("🎉 <b>Оплата прошла успешно! Подписка продлена на 30 дней.</b>", parse_mode="HTML")
-    await cb.answer()
+@dp.callback_query(F.data.in_(["toggle_clean_links", "toggle_clean_tags"]))
+async def cb_toggle_filters(query: CallbackQuery):
+    settings = await get_settings()
+    if query.data == "toggle_clean_links":
+        new_val = 0 if settings["clean_links"] else 1
+        await update_setting("clean_links", new_val)
+    else:
+        new_val = 0 if settings["clean_tags"] else 1
+        await update_setting("clean_tags", new_val)
+    settings = await get_settings()
+    await query.message.edit_reply_markup(
+        reply_markup=kb_filters_menu(bool(settings["clean_links"]), bool(settings["clean_tags"]))
+    )
+    await query.answer()
 
-# =======================================================
-# 6. ФИЛЬТР РЕКЛАМЫ И ОЧИСТКА
-# =======================================================
-STOP_WORDS = ["казино", "1win", "промокод", "скидки", "ставки", "вавада", "vavada", "подпишись на спонсора", "партнерский"]
+# --- ПЕРЕХВАТ И ПЕРЕСЫЛКА ЧЕРЕЗ TELETHON ---
+@client.on(events.NewMessage)
+async def telethon_grabber_handler(event):
+    try:
+        settings = await get_settings()
+        if not settings or not settings["is_active"] or not settings["target_chat"]:
+            return
 
-def clean_post_text(raw_text: str, signature: str) -> Optional[str]:
-    if not raw_text:
-        return signature if signature else None
+        chat = await event.get_chat()
+        chat_id = chat.id
 
-    lower_text = raw_text.lower()
-    for word in STOP_WORDS:
-        if word in lower_text:
-            return None
+        donors = await get_donors()
+        donor_ids = [d["channel_id"] for d in donors]
 
-    text = re.sub(r"https?://\S+", "", raw_text)
-    text = re.sub(r"@\w+", "", text)
-    text = text.strip()
+        if chat_id not in donor_ids and getattr(chat, 'broadcast', False) is False:
+            return
 
-    if signature:
-        text = f"{text}\n\n{signature}" if text else signature
+        if chat_id not in donor_ids:
+            return
 
-    return text
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute(
+                "SELECT 1 FROM history WHERE donor_id = ? AND post_id = ?",
+                (chat_id, event.id)
+            ) as cursor:
+                if await cursor.fetchone():
+                    return
 
-# =======================================================
-# 7. ФОНОВЫЙ ГРАББЕР (24/7)
-# =======================================================
-async def fetch_channel_posts(channel_name: str):
-    """Парсинг открытого канала через публичное веб-зеркало Telegram."""
-    url = f"https://t.me/s/{channel_name}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                return []
-            html = await resp.text()
+            await db.execute(
+                "INSERT INTO history (donor_id, post_id) VALUES (?, ?)",
+                (chat_id, event.id)
+            )
+            await db.commit()
 
-    soup = BeautifulSoup(html, "html.parser")
-    messages = soup.find_all("div", class_="tgme_widget_message")
-    parsed_posts = []
+        clean_text = clean_post_text(
+            event.raw_text,
+            bool(settings["clean_links"]),
+            bool(settings["clean_tags"])
+        )
 
-    for msg in messages[-5:]:
-        post_id = msg.get("data-post")
-        if not post_id:
-            continue
+        target = settings["target_chat"]
+        if target.startswith("-100") or target.startswith("-"):
+            target = int(target)
 
-        text_block = msg.find("div", class_="tgme_widget_message_text")
-        text = text_block.get_text(separator="\n").strip() if text_block else ""
+        if event.message.media:
+            await client.send_message(target, clean_text, file=event.message.media)
+        else:
+            if clean_text:
+                await client.send_message(target, clean_text)
 
-        photo_tag = msg.find("a", class_="tgme_widget_message_photo_wrap")
-        photo_url = None
-        if photo_tag and "background-image:url('" in photo_tag.get("style", ""):
-            style = photo_tag.get("style")
-            photo_url = style.split("background-image:url('")[1].split("')")[0]
+        logging.info(f"Успешно переслан пост {event.id} из {chat.title} в {target}")
+    except Exception as err:
+        logging.error(f"Ошибка при граббинге поста: {err}")
 
-        parsed_posts.append({"id": post_id, "text": text, "photo": photo_url})
-
-    return parsed_posts
-
-async def grabber_loop():
-    """Фоновый цикл проверки доноров и отправки постов."""
-    await asyncio.sleep(5)
-    logging.info("[*] Фоновый граббер запущен!")
-    while True:
-        try:
-            with sqlite3.connect("grabber_saas.db") as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT user_id, sub_until, donor_channel, target_channel, signature FROM users")
-                users = cursor.fetchall()
-
-            for user_id, sub_until, donor, target, signature in users:
-                if not donor or not target or not sub_until:
-                    continue
-
-                if datetime.strptime(sub_until, "%Y-%m-%d %H:%M:%S") < datetime.now():
-                    continue
-
-                posts = await fetch_channel_posts(donor)
-                for post in posts:
-                    if db_is_post_sent(user_id, post["id"]):
-                        continue
-
-                    final_text = clean_post_text(post["text"], signature or "")
-                    if final_text is None and not post["photo"]:
-                        db_mark_post_sent(user_id, post["id"])
-                        continue
-
-                    try:
-                        if post["photo"]:
-                            await bot.send_photo(chat_id=target, photo=post["photo"], caption=final_text)
-                        elif final_text:
-                            await bot.send_message(chat_id=target, text=final_text)
-
-                        db_mark_post_sent(user_id, post["id"])
-                        logging.info(f"[+] Пост {post['id']} отправлен в канал {target}")
-                        await asyncio.sleep(3)
-                    except Exception as err:
-                        logging.error(f"[-] Ошибка отправки в {target}: {err}")
-
-        except Exception as e:
-            logging.error(f"[!] Ошибка в цикле граббера: {e}")
-
-        await asyncio.sleep(30)
-
-# =======================================================
-# 8. ЗАПУСК
-# =======================================================
+# --- ТОЧКА ВХОДА ---
 async def main():
-    db_init()
-    asyncio.create_task(grabber_loop())
+    await init_db()
+    logging.info("База данных готова.")
+    await client.start()
+    logging.info("Telethon юзербот успешно авторизован.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
